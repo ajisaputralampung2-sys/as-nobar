@@ -1,0 +1,1430 @@
+const APP = {
+  TITLE: 'Quis Adu Gengsi by @AS',
+  ROOM_PREFIX: 'AG_ROOM_',
+  ROOM_TTL_SECONDS: 21600,
+  QUESTION_SECONDS: 15,
+  MAX_PLAYERS: 10
+};
+
+const DEFAULT_QUESTIONS = [
+  {q:'Ibu kota Jepang adalah?', options:['Beijing','Tokyo','Seoul','Bangkok'], answer:1, explanation:'Tokyo adalah ibu kota Jepang dan pusat pemerintahan nasional negara tersebut.'},
+  {q:'Planet terbesar di tata surya adalah?', options:['Bumi','Mars','Jupiter','Venus'], answer:2, explanation:'Jupiter merupakan planet terbesar di tata surya, baik dari segi diameter maupun massa.'},
+  {q:'Hasil dari 8 × 7 adalah?', options:['54','56','64','48'], answer:1, explanation:'Delapan dikali tujuh sama dengan 56.'},
+  {q:'Hewan yang dikenal sebagai raja hutan adalah?', options:['Harimau','Gajah','Singa','Serigala'], answer:2, explanation:'Singa sering dijuluki raja hutan dalam ungkapan populer, meskipun habitat alaminya terutama sabana dan padang rumput.'},
+  {q:'Lambang kimia air adalah?', options:['CO₂','O₂','H₂O','NaCl'], answer:2, explanation:'Rumus kimia air adalah H₂O, yang menunjukkan dua atom hidrogen dan satu atom oksigen.'},
+  {q:'Benua terbesar di dunia adalah?', options:['Afrika','Asia','Eropa','Australia'], answer:1, explanation:'Asia adalah benua terbesar berdasarkan luas wilayah dan jumlah penduduk.'},
+  {q:'Warna hasil campuran biru dan kuning adalah?', options:['Ungu','Hijau','Oranye','Merah'], answer:1, explanation:'Dalam pencampuran pigmen cat, warna biru dan kuning biasanya menghasilkan warna hijau.'},
+  {q:'Berapa jumlah hari dalam satu minggu?', options:['5','6','7','8'], answer:2, explanation:'Satu minggu terdiri dari tujuh hari: Senin, Selasa, Rabu, Kamis, Jumat, Sabtu, dan Minggu.'},
+  {q:'Alat untuk mengukur suhu adalah?', options:['Barometer','Termometer','Speedometer','Kompas'], answer:1, explanation:'Termometer digunakan untuk mengukur suhu. Barometer mengukur tekanan udara, sedangkan speedometer mengukur kecepatan.'},
+  {q:'Bahasa resmi Brasil adalah?', options:['Spanyol','Portugis','Inggris','Prancis'], answer:1, explanation:'Bahasa resmi Brasil adalah bahasa Portugis karena sejarah kolonial negara tersebut.'}
+];
+
+function doGet(e) {
+  // API JSONP untuk frontend AS NOBAR mandiri (GitHub Pages/hosting HTTPS).
+  // Rute HTML lama untuk AS GAME CENTER tetap dipertahankan.
+  var params = (e && e.parameter) ? e.parameter : {};
+  if (params.api) return asNobarApiJsonp_(params);
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('AS GAME CENTER by @AS')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function asNobarApiJsonp_(params) {
+  var callback = String(params.callback || '');
+  if (!/^[A-Za-z_$][0-9A-Za-z_$]*$/.test(callback)) {
+    return ContentService.createTextOutput('/* Invalid callback */')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  var routes = {
+    nobarCreateRoom: nobarCreateRoom,
+    nobarJoinRoom: nobarJoinRoom,
+    nobarListRooms: nobarListRooms,
+    nobarGetState: nobarGetState,
+    nobarRtcSend: nobarRtcSend,
+    nobarRtcPoll: nobarRtcPoll,
+    nobarSetMedia: nobarSetMedia,
+    nobarSetTVChannel: nobarSetTVChannel,
+    nobarControl: nobarControl,
+    nobarSyncPosition: nobarSyncPosition,
+    nobarSendChat: nobarSendChat
+  };
+  var result;
+  try {
+    var action = String(params.api || '');
+    if (!Object.prototype.hasOwnProperty.call(routes, action)) throw new Error('API AS NOBAR tidak dikenal.');
+    var payload = {};
+    if (params.payload) {
+      payload = JSON.parse(String(params.payload));
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Payload tidak valid.');
+    }
+    result = routes[action](payload);
+  } catch (err) {
+    result = {ok:false, error:String(err && err.message ? err.message : err)};
+  }
+  var body = callback + '(' + JSON.stringify(result) + ');';
+  return ContentService.createTextOutput(body).setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+function createRoom(payload) {
+  payload = payload || {};
+  const name = cleanName_(payload.name || 'Host');
+  const mode = payload.mode === 'ai' ? 'ai' : 'default';
+  const topic = String(payload.topic || 'Pengetahuan umum').slice(0, 100);
+  const difficulty = String(payload.difficulty || 'Campuran').slice(0, 30);
+
+  // Mode biasa mengambil 10 soal acak dari tab "Bank Soal".
+  // Mode AI tetap menggunakan Gemini seperti sebelumnya.
+  let questions;
+  if (mode === 'ai') {
+    questions = generateUniqueAIQuestions_(topic, difficulty);
+  } else {
+    questions = getRandomBankQuestions_(10);
+    // Jika API Gemini sudah disetel, buat pembahasan untuk soal bank yang belum memilikinya.
+    try { addAIExplanationsIfConfigured_(questions); } catch (e) { console.warn('Pembahasan AI dilewati: ' + e.message); }
+  }
+
+  const code = makeRoomCode_();
+  const hostId = Utilities.getUuid();
+  const room = {
+    code: code,
+    hostId: hostId,
+    status: 'lobby',
+    mode: mode,
+    topic: topic,
+    difficulty: difficulty,
+    questions: questions,
+    questionIndex: -1,
+    questionStartedAt: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    // Host hanya mengendalikan permainan dan tidak masuk daftar pemain/skor.
+    players: [],
+    music: {url:'', action:'pause', sequence:0, updatedAt:Date.now()}
+  };
+  saveRoom_(room);
+  return {ok:true, code:code, playerId:hostId, room:publicRoom_(room, hostId)};
+}
+
+function joinRoom(payload) {
+  payload = payload || {};
+  const code = normalizeCode_(payload.code);
+  const name = cleanName_(payload.name || 'Pemain');
+  const room = loadRoom_(code);
+  if (!room) throw new Error('Room tidak ditemukan. Periksa kode room.');
+  if (room.status === 'finished') throw new Error('Permainan sudah selesai.');
+  let player = room.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+  if (player) return {ok:true, code:code, playerId:player.id, room:publicRoom_(room, player.id)};
+  if (room.players.length >= APP.MAX_PLAYERS) throw new Error('Room sudah penuh (maksimal 10 pemain).');
+  player = {id:Utilities.getUuid(), name:name, score:0, answers:[], joinedAt:Date.now(), isHost:false};
+  room.players.push(player);
+  room.updatedAt = Date.now();
+  saveRoom_(room);
+  return {ok:true, code:code, playerId:player.id, room:publicRoom_(room, player.id)};
+}
+
+function getRoomState(payload) {
+  payload = payload || {};
+  const room = loadRoom_(normalizeCode_(payload.code));
+  if (!room) throw new Error('Room tidak ditemukan atau sudah kedaluwarsa.');
+  return {ok:true, room:publicRoom_(room, String(payload.playerId || ''))};
+}
+
+function startGame(payload) {
+  payload = payload || {};
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const room = requireRoom_(payload);
+    requireHost_(room, payload.playerId);
+    if (room.status !== 'lobby') throw new Error('Permainan sudah dimulai.');
+    if (room.players.length < 1) throw new Error('Belum ada pemain.');
+
+    // Periksa ulang tepat sebelum soal ditampilkan. Ini mencegah dua room
+    // memakai soal yang sama jika keduanya dibuat hampir bersamaan.
+    let used = getUsedQuestionHashes_();
+    let duplicate = room.questions.some(q => used.has(questionFingerprint_(q)));
+    if (duplicate && room.mode !== 'ai') {
+      // Jika ada tabrakan karena room dibuat bersamaan, ambil set soal bank yang baru.
+      room.questions = getRandomBankQuestions_(10);
+      used = getUsedQuestionHashes_();
+      duplicate = room.questions.some(q => used.has(questionFingerprint_(q)));
+    }
+    if (duplicate) {
+      throw new Error('Ada soal yang sudah pernah ditampilkan di room lain. Buat room baru agar sistem memilih soal yang belum pernah dipakai.');
+    }
+
+    // Catat soal sebagai pernah ditampilkan ketika permainan benar-benar dimulai.
+    recordQuestionsUsed_(room);
+    room.status = 'playing';
+    room.questionIndex = 0;
+    room.questionStartedAt = Date.now();
+    room.updatedAt = Date.now();
+    saveRoom_(room);
+    return {ok:true, room:publicRoom_(room, payload.playerId)};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Host mengatur lagu SoundCloud untuk semua perangkat dalam room. */
+function controlMusic(payload) {
+  payload = payload || {};
+  const room = requireRoom_(payload);
+  requireHost_(room, payload.playerId);
+  const action = String(payload.action || 'pause');
+  const allowed = ['load', 'play', 'pause'];
+  if (allowed.indexOf(action) < 0) throw new Error('Perintah musik tidak valid.');
+  room.music = room.music || {url:'', action:'pause', sequence:0, updatedAt:Date.now()};
+  let url = String(payload.url || room.music.url || '').trim();
+  if (action === 'load') {
+    if (!/^https?:\/\/(www\.)?(soundcloud\.com|on\.soundcloud\.com)\//i.test(url)) {
+      throw new Error('Masukkan tautan lagu atau playlist SoundCloud yang valid.');
+    }
+    room.music.url = url;
+  }
+  if ((action === 'play' || action === 'pause') && !room.music.url) {
+    throw new Error('Masukkan dan terapkan tautan lagu SoundCloud terlebih dahulu.');
+  }
+  room.music.action = action;
+  room.music.sequence = Number(room.music.sequence || 0) + 1;
+  room.music.updatedAt = Date.now();
+  saveRoom_(room);
+  return {ok:true, room:publicRoom_(room, payload.playerId)};
+}
+
+function submitAnswer(payload) {
+  payload = payload || {};
+  const room = requireRoom_(payload);
+  if (room.status !== 'playing') throw new Error('Permainan belum berlangsung.');
+  const player = room.players.find(p => p.id === String(payload.playerId));
+  if (!player) throw new Error('Pemain tidak ditemukan.');
+  const idx = room.questionIndex;
+  if (idx < 0 || idx >= room.questions.length) throw new Error('Soal tidak tersedia.');
+  const elapsedNow = (Date.now() - Number(room.questionStartedAt || Date.now())) / 1000;
+  if (elapsedNow >= APP.QUESTION_SECONDS) throw new Error('Waktu menjawab sudah habis.');
+  const q = room.questions[idx];
+  const choice = Number(payload.choice);
+  if (!Number.isInteger(choice) || choice < 0 || choice >= q.options.length) throw new Error('Pilihan jawaban tidak valid.');
+
+  // Pilihan terbaru menggantikan pilihan sebelumnya selama timer masih berjalan.
+  const correct = choice === Number(q.answer);
+  const elapsed = Math.max(0, Math.min(APP.QUESTION_SECONDS, elapsedNow));
+  const speedBonus = correct ? Math.max(0, Math.ceil(APP.QUESTION_SECONDS - elapsed)) : 0;
+  const points = correct ? 100 + speedBonus : 0;
+  const existingIndex = player.answers.findIndex(a => a.questionIndex === idx);
+  const updatedAnswer = {questionIndex:idx, choice:choice, correct:correct, points:points, elapsed:elapsed, changedAt:Date.now()};
+  if (existingIndex >= 0) player.answers[existingIndex] = updatedAnswer;
+  else player.answers.push(updatedAnswer);
+
+  // Hitung ulang skor dari jawaban final setiap soal agar perubahan pilihan tidak menggandakan poin.
+  player.score = player.answers.reduce((sum, a) => sum + Number(a.points || 0), 0);
+  room.updatedAt = Date.now();
+  saveRoom_(room);
+  return {ok:true, correct:correct, points:points, room:publicRoom_(room, player.id)};
+}
+
+function nextQuestion(payload) {
+  const room = requireRoom_(payload);
+  requireHost_(room, payload.playerId);
+  if (room.status !== 'playing') throw new Error('Permainan tidak sedang berlangsung.');
+  const elapsed = (Date.now() - Number(room.questionStartedAt || Date.now())) / 1000;
+  if (elapsed < APP.QUESTION_SECONDS) throw new Error('Tunggu sampai timer 25 detik habis agar pemain masih bisa mengubah jawaban.');
+  if (room.questionIndex >= room.questions.length - 1) {
+    room.status = 'finished';
+    room.updatedAt = Date.now();
+  } else {
+    room.questionIndex++;
+    room.questionStartedAt = Date.now();
+    room.updatedAt = Date.now();
+  }
+  saveRoom_(room);
+  return {ok:true, room:publicRoom_(room, payload.playerId)};
+}
+
+
+/**
+ * Mengambil soal secara acak dari tab "Bank Soal".
+ * Kolom yang dibaca: Pertanyaan, Pilihan A-D, Kunci.
+ * Jika Kunci kosong/tidak dikenali, fungsi mencoba kolom Jawaban Benar.
+ */
+function getRandomBankQuestions_(jumlah) {
+  const spreadsheetId = '1i5PPVh3Hf2_gRzWNL6mK2WYEU_4j9N9D';
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = ss.getSheetByName('Bank Soal');
+
+  if (!sheet) {
+    throw new Error('Tab "Bank Soal" tidak ditemukan di spreadsheet database. Pastikan nama tab tepat: Bank Soal.');
+  }
+
+  const values = sheet.getDataRange().getDisplayValues();
+  if (values.length < 2) {
+    throw new Error('Tab "Bank Soal" belum memiliki baris soal. Pastikan baris pertama adalah judul kolom.');
+  }
+
+  const normalizeHeader = value => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const headers = values[0].map(normalizeHeader);
+  const col = name => headers.indexOf(normalizeHeader(name));
+
+  const qCol = col('Pertanyaan');
+  const aCol = col('Pilihan A');
+  const bCol = col('Pilihan B');
+  const cCol = col('Pilihan C');
+  const dCol = col('Pilihan D');
+  const keyCol = col('Kunci');
+  const correctTextCol = col('Jawaban Benar');
+  const explanationCol = col('Penjelasan') >= 0 ? col('Penjelasan') : col('Pembahasan');
+
+  const missing = [];
+  if (qCol < 0) missing.push('Pertanyaan');
+  if (aCol < 0) missing.push('Pilihan A');
+  if (bCol < 0) missing.push('Pilihan B');
+  if (cCol < 0) missing.push('Pilihan C');
+  if (dCol < 0) missing.push('Pilihan D');
+  if (keyCol < 0 && correctTextCol < 0) missing.push('Kunci atau Jawaban Benar');
+
+  if (missing.length) {
+    throw new Error('Kolom Bank Soal belum sesuai. Kolom yang tidak ditemukan: ' + missing.join(', ') + '. Periksa baris judul kolom.');
+  }
+
+  const questions = [];
+  const usedHashes = getUsedQuestionHashes_();
+  const seenThisLoad = new Set();
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const q = String(row[qCol] || '').trim();
+    const options = [row[aCol], row[bCol], row[cCol], row[dCol]].map(v => String(v || '').trim());
+    if (!q || options.some(v => !v)) continue;
+
+    let answer = -1;
+    const key = keyCol >= 0 ? String(row[keyCol] || '').trim().toUpperCase() : '';
+    if (/^[A-D]$/.test(key)) {
+      answer = key.charCodeAt(0) - 65;
+    } else if (key === '0') {
+      answer = 0;
+    } else if (/^[1-4]$/.test(key)) {
+      // Format angka 1-4 dianggap sebagai posisi pilihan A-D.
+      answer = Number(key) - 1;
+    }
+
+    if (answer < 0 && correctTextCol >= 0) {
+      const correctText = String(row[correctTextCol] || '').trim().toLowerCase();
+      answer = options.findIndex(option => option.toLowerCase() === correctText);
+    }
+    if (answer < 0 || answer > 3) continue;
+
+    const item = {q:q.slice(0, 500), options:options.map(v => v.slice(0, 200)), answer:answer, explanation:explanationCol >= 0 ? String(row[explanationCol] || '').trim().slice(0, 1200) : ''};
+    const fingerprint = questionFingerprint_(item);
+    // Otomatis blokir soal yang sudah pernah ditampilkan serta duplikat dalam tab Bank Soal.
+    if (usedHashes.has(fingerprint) || seenThisLoad.has(fingerprint)) continue;
+    seenThisLoad.add(fingerprint);
+    questions.push(item);
+  }
+
+  if (questions.length < jumlah) {
+    throw new Error('Soal unik yang belum pernah ditampilkan tersisa ' + questions.length + '. Diperlukan minimal ' + jumlah + ' soal baru. Tambahkan soal baru ke tab Bank Soal atau reset riwayat jika memang ingin mengulang soal lama.');
+  }
+
+  // Fisher-Yates shuffle agar setiap room mendapat urutan acak.
+  for (let i = questions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const temp = questions[i];
+    questions[i] = questions[j];
+    questions[j] = temp;
+  }
+
+  return questions.slice(0, jumlah);
+}
+
+
+/**
+ * Riwayat global soal yang sudah pernah ditampilkan.
+ * Fingerprint menggunakan teks pertanyaan yang dinormalisasi agar perubahan pilihan
+ * jawaban tidak membuat pertanyaan yang sama lolos sebagai soal baru.
+ */
+const QUESTION_HISTORY_SHEET = 'Riwayat Soal';
+const QUESTION_HISTORY_MIGRATION_KEY = 'AG_QUESTION_HISTORY_MIGRATED_V1';
+
+function questionFingerprint_(question) {
+  const normalized = String(question && question.q || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, normalized, Utilities.Charset.UTF_8);
+  return Utilities.base64EncodeWebSafe(digest).replace(/=+$/g, '');
+}
+
+function questionHistorySheet_() {
+  const ss = SpreadsheetApp.openById('1i5PPVh3Hf2_gRzWNL6mK2WYEU_4j9N9D');
+  let sheet = ss.getSheetByName(QUESTION_HISTORY_SHEET);
+  if (!sheet) sheet = ss.insertSheet(QUESTION_HISTORY_SHEET);
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(['Fingerprint', 'Pertanyaan', 'Sumber', 'Kode Room', 'Waktu Ditampilkan']);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function getUsedQuestionHashes_() {
+  const sheet = questionHistorySheet_();
+  // Migrasi sekali: tandai soal dari room lama yang memang sudah sempat berjalan.
+  // Room yang masih lobby tidak dianggap pernah ditampilkan.
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(QUESTION_HISTORY_MIGRATION_KEY) !== '1') {
+    const existing = new Set();
+    const last = sheet.getLastRow();
+    if (last > 1) sheet.getRange(2, 1, last - 1, 1).getDisplayValues().forEach(r => existing.add(String(r[0] || '')));
+    const allProps = props.getProperties();
+    const rows = [];
+    Object.keys(allProps).forEach(key => {
+      if (key.indexOf(APP.ROOM_PREFIX) !== 0) return;
+      try {
+        const room = JSON.parse(allProps[key]);
+        if (!room || !['playing', 'finished'].includes(room.status) || !Array.isArray(room.questions)) return;
+        const maxShown = room.status === 'finished' ? room.questions.length - 1 : Number(room.questionIndex || 0);
+        for (let i = 0; i <= maxShown && i < room.questions.length; i++) {
+          const q = room.questions[i];
+          if (!q || !q.q) continue;
+          const hash = questionFingerprint_(q);
+          if (existing.has(hash)) continue;
+          existing.add(hash);
+          rows.push([hash, String(q.q).slice(0, 500), room.mode === 'ai' ? 'AI' : 'Bank Soal/room lama', String(room.code || ''), new Date(room.createdAt || Date.now())]);
+        }
+      } catch (e) { /* Lewati data room lama yang rusak. */ }
+    });
+    if (rows.length) sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+    props.setProperty(QUESTION_HISTORY_MIGRATION_KEY, '1');
+  }
+
+  const lastRow = sheet.getLastRow();
+  const hashes = new Set();
+  if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues().forEach(row => {
+    const hash = String(row[0] || '').trim();
+    if (hash) hashes.add(hash);
+  });
+  return hashes;
+}
+
+function recordQuestionsUsed_(room) {
+  const sheet = questionHistorySheet_();
+  const existing = getUsedQuestionHashes_();
+  const rows = [];
+  const local = new Set();
+  (room.questions || []).forEach(q => {
+    if (!q || !q.q) return;
+    const hash = questionFingerprint_(q);
+    if (existing.has(hash) || local.has(hash)) return;
+    local.add(hash);
+    rows.push([hash, String(q.q).slice(0, 500), room.mode === 'ai' ? 'AI Gemini' : 'Bank Soal', String(room.code || ''), new Date()]);
+  });
+  if (rows.length !== (room.questions || []).length) {
+    throw new Error('Ada pertanyaan duplikat atau sudah pernah dipakai. Buat room baru untuk mendapatkan soal yang belum pernah ditampilkan.');
+  }
+  if (rows.length) sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function generateUniqueAIQuestions_(topic, difficulty) {
+  const used = getUsedQuestionHashes_();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const generated = generateAIQuestions_(topic, difficulty);
+    const seen = new Set();
+    const unique = generated.every(q => {
+      const hash = questionFingerprint_(q);
+      if (used.has(hash) || seen.has(hash)) return false;
+      seen.add(hash);
+      return true;
+    });
+    if (unique) return generated;
+  }
+  throw new Error('Gemini terus menghasilkan soal yang pernah dipakai atau duplikat. Coba topik lain atau gunakan mode Bank Soal.');
+}
+
+/** Jalankan sekali dari editor Apps Script untuk menguji akses ke Bank Soal. */
+function testBankSoalConnection() {
+  const questions = getRandomBankQuestions_(10);
+  return 'Berhasil membaca Bank Soal. Contoh soal: ' + questions[0].q +
+    '. Total yang dipilih secara acak: ' + questions.length + '.';
+}
+
+function generateAIQuestions_(topic, difficulty) {
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!key) throw new Error('API key belum dipasang. Buka Project Settings > Script properties, lalu tambahkan GEMINI_API_KEY.');
+  const prompt = 'Buat tepat 10 soal kuis pilihan ganda berbahasa Indonesia untuk remaja. Topik: ' + topic +
+    '. Tingkat kesulitan: ' + difficulty + '. Setiap soal memiliki tepat 4 pilihan dan satu jawaban benar. ' +
+    'Kembalikan HANYA JSON array tanpa markdown dengan format: [{"q":"teks soal","options":["A","B","C","D"],"answer":0,"explanation":"penjelasan singkat mengapa jawaban benar"}]. ' +
+    'answer adalah indeks 0 sampai 3. Pastikan fakta benar, soal bervariasi, dan explanation menjelaskan jawaban benar dalam 1-3 kalimat.';
+  const models = ['gemini-3.5-flash', 'gemini-2.5-flash'];
+  let lastError = '';
+  for (let m = 0; m < models.length; m++) {
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + models[m] + ':generateContent';
+    const payload = {
+      contents: [{role:'user', parts:[{text:prompt}]}],
+      generationConfig: {temperature:0.8, maxOutputTokens:5000, responseMimeType:'application/json'}
+    };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let response;
+      try {
+        response = UrlFetchApp.fetch(url, {
+          method:'post',
+          contentType:'application/json',
+          headers:{'x-goog-api-key':key},
+          payload:JSON.stringify(payload),
+          muteHttpExceptions:true
+        });
+      } catch (e) {
+        lastError = String(e.message || e);
+        break;
+      }
+      const status = response.getResponseCode();
+      const body = response.getContentText();
+      if (status >= 200 && status < 300) {
+        try {
+          const data = JSON.parse(body);
+          const textOut = data.candidates && data.candidates[0] &&
+            data.candidates[0].content && data.candidates[0].content.parts &&
+            data.candidates[0].content.parts.map(p => p.text || '').join('');
+          if (!textOut) throw new Error('Respons AI kosong.');
+          const parsed = JSON.parse(textOut.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,''));
+          if (!Array.isArray(parsed) || parsed.length !== 10) throw new Error('AI tidak mengembalikan tepat 10 soal.');
+          return parsed.map((q, i) => {
+            if (!q || typeof q.q !== 'string' || !Array.isArray(q.options) || q.options.length !== 4 ||
+                !Number.isInteger(Number(q.answer)) || Number(q.answer) < 0 || Number(q.answer) > 3) {
+              throw new Error('Format soal nomor ' + (i + 1) + ' tidak valid.');
+            }
+            return {q:q.q.slice(0,500), options:q.options.map(x => String(x).slice(0,200)), answer:Number(q.answer), explanation:String(q.explanation || '').slice(0,1200)};
+          });
+        } catch (e) {
+          throw new Error('Respons Gemini tidak valid: ' + (e.message || e));
+        }
+      }
+      let detail = body;
+      try { const parsedErr = JSON.parse(body); detail = parsedErr.error && parsedErr.error.message || body; } catch (e) {}
+      lastError = 'HTTP ' + status + ': ' + detail.slice(0, 500);
+      if (![429,500,502,503,504].includes(status)) {
+        if (status === 404 && m < models.length - 1) break;
+        throw new Error('Gemini gagal. ' + lastError);
+      }
+      if (attempt < 2) Utilities.sleep(1500 * Math.pow(2, attempt));
+    }
+  }
+  throw new Error('Gemini sedang sibuk atau model tidak tersedia. ' + lastError + '. Coba lagi beberapa saat nanti.');
+}
+
+function addAIExplanationsIfConfigured_(questions) {
+  const missing = questions.filter(q => !String(q.explanation || '').trim());
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!missing.length || !key) return;
+  const payloadQuestions = missing.map((q, i) => ({id:i, question:q.q, options:q.options, correctAnswer:q.options[q.answer]}));
+  const prompt = 'Buat pembahasan singkat dan faktual dalam bahasa Indonesia untuk setiap soal kuis berikut. Kembalikan hanya JSON array berisi objek {"id":0,"explanation":"..."}. Jelaskan mengapa jawaban yang disediakan benar, 1-3 kalimat, jangan mengubah kunci. Data: ' + JSON.stringify(payloadQuestions);
+  const models = ['gemini-2.5-flash','gemini-2.0-flash'];
+  for (const model of models) {
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
+    const response = UrlFetchApp.fetch(url, {
+      method:'post', contentType:'application/json', headers:{'x-goog-api-key':key},
+      payload:JSON.stringify({contents:[{role:'user',parts:[{text:prompt}]}],generationConfig:{temperature:0.2,maxOutputTokens:4000,responseMimeType:'application/json'}}),
+      muteHttpExceptions:true
+    });
+    if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) continue;
+    try {
+      const data = JSON.parse(response.getContentText());
+      const textOut = data.candidates[0].content.parts.map(p => p.text || '').join('');
+      const parsed = JSON.parse(textOut.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,''));
+      if (!Array.isArray(parsed)) continue;
+      parsed.forEach(item => {
+        const target = missing[Number(item.id)];
+        if (target && item.explanation) target.explanation = String(item.explanation).slice(0,1200);
+      });
+      return;
+    } catch (e) { /* Coba model berikutnya; room tetap bisa dibuat tanpa pembahasan AI. */ }
+  }
+}
+
+function testGeminiConnection() {
+  const questions = generateAIQuestions_('Pengetahuan umum', 'Campuran');
+  return 'Berhasil! Gemini membuat ' + questions.length + ' soal. API key tidak ditampilkan.';
+}
+
+function publicRoom_(room, playerId) {
+  const me = room.players.find(p => p.id === playerId);
+  const isHost = String(playerId || '') === String(room.hostId || '');
+  const idx = room.questionIndex;
+  const current = idx >= 0 && idx < room.questions.length ? room.questions[idx] : null;
+  const currentAnswer = p => p.answers.find(a => a.questionIndex === idx) || null;
+  const players = room.players.map(p => {
+    const answer = currentAnswer(p);
+    const item = {
+      id:p.id, name:p.name, score:p.score, isHost:false,
+      answered:!!answer,
+      correctCount:p.answers.filter(a => a.correct).length,
+      totalAnswered:p.answers.length
+    };
+    // Pilihan live hanya dikirim ke host; pilihan semua pemain dibuka di review setelah kuis selesai.
+    if (isHost) item.choice = answer ? answer.choice : null;
+    return item;
+  }).sort((a,b) => b.score-a.score || a.name.localeCompare(b.name));
+  const q = current ? {
+    q:current.q,
+    options:current.options,
+    number:idx+1,
+    total:room.questions.length,
+    startedAt:room.questionStartedAt,
+    seconds:APP.QUESTION_SECONDS,
+    answer: room.status === 'finished' ? current.answer : null
+  } : null;
+  const myAnswer = me && idx >= 0 ? currentAnswer(me) : null;
+  const results = room.status === 'finished' ? room.players.map(p => ({
+    id:p.id, name:p.name, score:p.score, correctCount:p.answers.filter(a=>a.correct).length,
+    totalAnswered:p.answers.length,
+    averageTime:p.answers.length ? Math.round(p.answers.reduce((sum,a)=>sum+a.elapsed,0)/p.answers.length*10)/10 : null
+  })).sort((a,b)=>b.score-a.score || a.name.localeCompare(b.name)) : null;
+  const review = room.status === 'finished' ? room.questions.map((question, questionIndex) => ({
+    number:questionIndex+1,
+    q:question.q,
+    options:question.options,
+    answer:question.answer,
+    explanation:String(question.explanation || '').trim(),
+    playerAnswers:room.players.map(p => {
+      const a = p.answers.find(item => item.questionIndex === questionIndex);
+      return {id:p.id, name:p.name, choice:a ? a.choice : null, correct:!!(a && a.correct)};
+    })
+  })) : null;
+  return {
+    code:room.code, status:room.status, mode:room.mode, topic:room.topic,
+    difficulty:room.difficulty, players:players, question:q,
+    playerId:playerId, isHost:isHost, myAnswer:myAnswer,
+    questionCount:room.questions.length,
+    music:room.music || {url:'', action:'pause', sequence:0, updatedAt:0},
+    results:results,
+    review:review
+  };
+}
+
+function requireRoom_(payload) {
+  payload = payload || {};
+  const room = loadRoom_(normalizeCode_(payload.code));
+  if (!room) throw new Error('Room tidak ditemukan atau sudah kedaluwarsa.');
+  return room;
+}
+
+function requireHost_(room, playerId) {
+  if (String(playerId || '') !== String(room.hostId || '')) {
+    throw new Error('Hanya host yang bisa melakukan tindakan ini.');
+  }
+}
+
+function saveRoom_(room) {
+  room.updatedAt = Date.now();
+  PropertiesService.getScriptProperties().setProperty(APP.ROOM_PREFIX + room.code, JSON.stringify(room));
+}
+
+function loadRoom_(code) {
+  if (!code) return null;
+  const raw = PropertiesService.getScriptProperties().getProperty(APP.ROOM_PREFIX + code);
+  if (!raw) return null;
+  try {
+    const room = JSON.parse(raw);
+    if (Date.now() - Number(room.updatedAt || room.createdAt) > APP.ROOM_TTL_SECONDS * 1000) return null;
+    return room;
+  } catch (e) { return null; }
+}
+
+function makeRoomCode_() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let tries = 0; tries < 20; tries++) {
+    let code = '';
+    for (let i = 0; i < 5; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+    if (!loadRoom_(code)) return code;
+  }
+  throw new Error('Tidak bisa membuat kode room. Coba lagi.');
+}
+
+function normalizeCode_(code) {
+  return String(code || '').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,5);
+}
+
+function cleanName_(name) {
+  const s = String(name || '').trim().replace(/\s+/g,' ').slice(0,24);
+  if (!s) throw new Error('Nama pemain wajib diisi.');
+  return s;
+}
+
+// ================= MONOPOLI BY AS: BACKEND TERPISAH =================
+
+const MP_CONFIG = {
+  PREFIX: 'MP_ROOM_',
+  MAX_PLAYERS: 8,
+  START_MONEY: 1500,
+  ROOM_TTL_MS: 21600000
+};
+
+const MP_BOARD = [
+  {name:'MULAI', type:'go', price:0},
+  {name:'Jalan Melati', type:'property', price:60, rent:10},
+  {name:'Dana Kejutan', type:'chance', price:0},
+  {name:'Jalan Mawar', type:'property', price:80, rent:15},
+  {name:'Pajak Kota', type:'tax', price:0, amount:100},
+  {name:'Stasiun Utara', type:'property', price:200, rent:40},
+  {name:'Jalan Anggrek', type:'property', price:100, rent:20},
+  {name:'Dana Kejutan', type:'chance', price:0},
+  {name:'Jalan Kenanga', type:'property', price:120, rent:25},
+  {name:'Penjara', type:'jail', price:0},
+  {name:'Jalan Cempaka', type:'property', price:140, rent:30},
+  {name:'Jalan Flamboyan', type:'property', price:140, rent:30},
+  {name:'Perusahaan Listrik', type:'property', price:150, rent:35},
+  {name:'Jalan Teratai', type:'property', price:160, rent:35},
+  {name:'Jalan Kamboja', type:'property', price:180, rent:40},
+  {name:'Stasiun Selatan', type:'property', price:200, rent:40},
+  {name:'Jalan Dahlia', type:'property', price:180, rent:40},
+  {name:'Dana Kejutan', type:'chance', price:0},
+  {name:'Jalan Sakura', type:'property', price:200, rent:45},
+  {name:'Parkir Bebas', type:'free', price:0},
+  {name:'Jalan Bougenvil', type:'property', price:220, rent:50},
+  {name:'Jalan Angsana', type:'property', price:220, rent:50},
+  {name:'Pajak Kota', type:'tax', price:0, amount:150},
+  {name:'Jalan Cemara', type:'property', price:240, rent:55},
+  {name:'Stasiun Timur', type:'property', price:200, rent:40},
+  {name:'Jalan Merpati', type:'property', price:260, rent:60},
+  {name:'Dana Kejutan', type:'chance', price:0},
+  {name:'Jalan Pahlawan', type:'property', price:260, rent:60},
+  {name:'Perusahaan Air', type:'property', price:150, rent:35},
+  {name:'Jalan Cendana', type:'property', price:280, rent:65},
+  {name:'Masuk Penjara', type:'jail', price:0},
+  {name:'Jalan Nusantara', type:'property', price:300, rent:70},
+  {name:'Jalan Puspa', type:'property', price:300, rent:70},
+  {name:'Dana Kejutan', type:'chance', price:0},
+  {name:'Jalan Rajawali', type:'property', price:320, rent:75},
+  {name:'Stasiun Barat', type:'property', price:200, rent:40},
+  {name:'Jalan Merdeka', type:'property', price:350, rent:85},
+  {name:'Pajak Kota', type:'tax', price:0, amount:200},
+  {name:'Jalan Kemuning', type:'property', price:380, rent:95},
+  {name:'Jalan Garuda', type:'property', price:400, rent:100}
+];
+
+function mpCreateRoom(payload) {
+  payload = payload || {};
+  const name = cleanName_(payload.name || 'Pemain 1');
+  const code = mpMakeCode_();
+  const id = Utilities.getUuid();
+  const now = Date.now();
+  const room = {
+    code: code, hostId: id, status: 'lobby',
+    players: [{id:id, name:name, money:MP_CONFIG.START_MONEY, position:0, properties:[], bankrupt:false}],
+    properties: {}, turn: 0, lastRoll: null,
+    message: name + ' membuat room. Menunggu pemain lain.',
+    createdAt: now, updatedAt: now
+  };
+  mpSaveRoom_(room);
+  return {ok:true, code:code, playerId:id, room:mpPublicRoom_(room, id)};
+}
+
+function mpJoinRoom(payload) {
+  payload = payload || {};
+  const code = mpNormalizeCode_(payload.code);
+  const name = cleanName_(payload.name || 'Pemain');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const room = mpLoadRoom_(code);
+    if (!room) throw new Error('Room Monopoli tidak ditemukan atau sudah kedaluwarsa.');
+    if (room.status !== 'lobby') throw new Error('Permainan sudah dimulai.');
+    const existing = room.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+    if (existing) return {ok:true, code:code, playerId:existing.id, room:mpPublicRoom_(room, existing.id)};
+    if (room.players.length >= MP_CONFIG.MAX_PLAYERS) throw new Error('Room penuh. Maksimal 8 pemain.');
+    const id = Utilities.getUuid();
+    room.players.push({id:id, name:name, money:MP_CONFIG.START_MONEY, position:0, properties:[], bankrupt:false});
+    room.message = name + ' bergabung ke room.';
+    mpSaveRoom_(room);
+    return {ok:true, code:code, playerId:id, room:mpPublicRoom_(room, id)};
+  } finally { lock.releaseLock(); }
+}
+
+function mpStartGame(payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const room = mpRequireRoom_(payload);
+    mpRequireHost_(room, payload.playerId);
+    if (room.status !== 'lobby') throw new Error('Permainan sudah dimulai.');
+    if (room.players.length < 2) throw new Error('Minimal 2 pemain untuk memulai.');
+    room.status = 'playing';
+    room.turn = 0;
+    room.message = 'Permainan dimulai! Giliran ' + room.players[0].name + '.';
+    mpSaveRoom_(room);
+    return {ok:true, room:mpPublicRoom_(room, payload.playerId)};
+  } finally { lock.releaseLock(); }
+}
+
+function mpRollDice(payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const room = mpRequireRoom_(payload);
+    if (room.status !== 'playing') throw new Error('Permainan belum dimulai.');
+    const player = mpCurrentPlayer_(room);
+    if (player.id !== String(payload.playerId)) throw new Error('Belum giliran kamu.');
+    if (room.lastRoll && !room.lastRoll.finishedTurn) throw new Error('Selesaikan giliran saat ini dahulu.');
+
+    const die1 = Math.floor(Math.random() * 6) + 1;
+    const die2 = Math.floor(Math.random() * 6) + 1;
+    const steps = die1 + die2;
+    const old = player.position;
+    const next = (old + steps) % MP_BOARD.length;
+    if (old + steps >= MP_BOARD.length) {
+      player.money += 200;
+    }
+    player.position = next;
+    const tile = MP_BOARD[next];
+    let message = player.name + ' melempar ' + die1 + ' + ' + die2 + ' = ' + steps + ', berhenti di ' + tile.name + '.';
+
+    if (tile.type === 'tax') {
+      player.money -= tile.amount;
+      message += ' Membayar pajak $' + tile.amount + '.';
+    } else if (tile.type === 'chance') {
+      const amount = [50, 100, -50, 150, -100][Math.floor(Math.random() * 5)];
+      player.money += amount;
+      message += amount >= 0 ? ' Dana kejutan: mendapat $' + amount + '.' : ' Dana kejutan: membayar $' + Math.abs(amount) + '.';
+    } else if (tile.type === 'property') {
+      const ownerId = room.properties[next];
+      if (ownerId && ownerId !== player.id) {
+        const owner = room.players.find(p => p.id === ownerId);
+        if (owner) {
+          player.money -= tile.rent;
+          owner.money += tile.rent;
+          message += ' Membayar sewa $' + tile.rent + ' kepada ' + owner.name + '.';
+        }
+      } else if (!ownerId) {
+        message += ' Properti tersedia untuk dibeli seharga $' + tile.price + '.';
+      } else {
+        message += ' Ini properti milikmu.';
+      }
+    }
+
+    if (player.money < 0) player.bankrupt = true;
+    room.lastRoll = {playerId:player.id, die1:die1, die2:die2, steps:steps, position:next, finishedTurn:false};
+    room.message = message;
+    mpCheckGameOver_(room);
+    mpSaveRoom_(room);
+    return {ok:true, room:mpPublicRoom_(room, payload.playerId)};
+  } finally { lock.releaseLock(); }
+}
+
+function mpBuyProperty(payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const room = mpRequireRoom_(payload);
+    if (room.status !== 'playing') throw new Error('Permainan belum dimulai.');
+    const player = mpCurrentPlayer_(room);
+    if (player.id !== String(payload.playerId)) throw new Error('Belum giliran kamu.');
+    if (!room.lastRoll || room.lastRoll.playerId !== player.id || room.lastRoll.finishedTurn) throw new Error('Lempar dadu dahulu.');
+    const pos = player.position;
+    const tile = MP_BOARD[pos];
+    if (tile.type !== 'property') throw new Error('Petak ini bukan properti.');
+    if (room.properties[pos]) throw new Error('Properti sudah dimiliki.');
+    if (player.money < tile.price) throw new Error('Uangmu tidak cukup.');
+    player.money -= tile.price;
+    player.properties.push(pos);
+    room.properties[pos] = player.id;
+    room.message = player.name + ' membeli ' + tile.name + ' seharga $' + tile.price + '.';
+    mpSaveRoom_(room);
+    return {ok:true, room:mpPublicRoom_(room, payload.playerId)};
+  } finally { lock.releaseLock(); }
+}
+
+function mpEndTurn(payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const room = mpRequireRoom_(payload);
+    if (room.status !== 'playing') throw new Error('Permainan belum dimulai.');
+    const player = mpCurrentPlayer_(room);
+    if (player.id !== String(payload.playerId)) throw new Error('Belum giliran kamu.');
+    if (!room.lastRoll || room.lastRoll.playerId !== player.id || room.lastRoll.finishedTurn) throw new Error('Lempar dadu sebelum mengakhiri giliran.');
+    room.lastRoll.finishedTurn = true;
+    const active = room.players.filter(p => !p.bankrupt);
+    if (active.length <= 1) {
+      room.status = 'finished';
+      room.message = 'Permainan selesai! Pemenang: ' + (active[0] ? active[0].name : 'Tidak ada');
+    } else {
+      let next = room.turn;
+      do { next = (next + 1) % room.players.length; } while (room.players[next].bankrupt);
+      room.turn = next;
+      room.lastRoll = null;
+      room.message = 'Giliran berikutnya: ' + room.players[next].name + '.';
+    }
+    mpSaveRoom_(room);
+    return {ok:true, room:mpPublicRoom_(room, payload.playerId)};
+  } finally { lock.releaseLock(); }
+}
+
+function mpGetState(payload) {
+  const room = mpRequireRoom_(payload);
+  return {ok:true, room:mpPublicRoom_(room, payload.playerId)};
+}
+
+function mpPublicRoom_(room, playerId) {
+  return {
+    code:room.code, status:room.status, hostId:room.hostId,
+    playerId:String(playerId || ''), isHost:String(playerId || '') === room.hostId,
+    players:room.players.map(p => ({id:p.id, name:p.name, money:p.money, position:p.position, properties:p.properties, bankrupt:p.bankrupt})),
+    board:MP_BOARD.map((t,i) => ({index:i,name:t.name,type:t.type,price:t.price,rent:t.rent || 0,amount:t.amount || 0})),
+    properties:room.properties, turn:room.turn,
+    currentPlayerId:(room.players[room.turn] || room.players[0]).id,
+    lastRoll:room.lastRoll, message:room.message
+  };
+}
+
+function mpCurrentPlayer_(room) {
+  return room.players[room.turn] || room.players[0];
+}
+
+function mpCheckGameOver_(room) {
+  const active = room.players.filter(p => !p.bankrupt);
+  if (active.length <= 1) {
+    room.status = 'finished';
+    room.message = 'Permainan selesai! Pemenang: ' + (active[0] ? active[0].name : 'Tidak ada');
+  }
+}
+
+function mpRequireRoom_(payload) {
+  payload = payload || {};
+  const room = mpLoadRoom_(mpNormalizeCode_(payload.code));
+  if (!room) throw new Error('Room Monopoli tidak ditemukan atau kedaluwarsa.');
+  return room;
+}
+
+function mpRequireHost_(room, playerId) {
+  if (String(playerId || '') !== room.hostId) throw new Error('Hanya host yang bisa memulai permainan.');
+}
+
+function mpSaveRoom_(room) {
+  room.updatedAt = Date.now();
+  PropertiesService.getScriptProperties().setProperty(MP_CONFIG.PREFIX + room.code, JSON.stringify(room));
+}
+
+function mpLoadRoom_(code) {
+  if (!code) return null;
+  const raw = PropertiesService.getScriptProperties().getProperty(MP_CONFIG.PREFIX + code);
+  if (!raw) return null;
+  try {
+    const room = JSON.parse(raw);
+    if (Date.now() - Number(room.updatedAt || room.createdAt) > MP_CONFIG.ROOM_TTL_MS) return null;
+    return room;
+  } catch (e) { return null; }
+}
+
+function mpNormalizeCode_(code) {
+  return String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0,5);
+}
+
+function mpMakeCode_() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let tries = 0; tries < 30; tries++) {
+    let code = '';
+    for (let i = 0; i < 5; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+    if (!mpLoadRoom_(code)) return code;
+  }
+  throw new Error('Tidak bisa membuat kode room. Coba lagi.');
+}
+
+
+/* ================= AS NOBAR MODULE ================= */
+/* =========================================================
+ * AS NOBAR MODULE — terpisah dari room game yang sudah ada.
+ * Menyimpan room di Script Properties dengan prefix tersendiri.
+ * Sumber awal: YouTube, SoundCloud, dan URL media langsung.
+ * ========================================================= */
+const NOBAR_CFG = {
+  PREFIX: 'AS_NOBAR_ROOM_',
+  TTL_MS: 6 * 60 * 60 * 1000,
+  MAX_MEMBERS: 30,
+  MAX_MESSAGES: 25
+};
+
+function nobarCreateRoom(payload) {
+  payload = payload || {};
+  const name = nobarCleanName_(payload.name || 'Host');
+  const code = nobarMakeCode_();
+  const hostId = Utilities.getUuid();
+  const room = {
+    code: code, hostId: hostId, hostName: name, status: 'lobby',
+    createdAt: Date.now(), updatedAt: Date.now(),
+    media: {url:'', type:'', title:'', action:'pause', lastCommand:'pause', sequence:0, changedAt:Date.now(), positionSeconds:0, positionAt:Date.now(), positionUpdatedAt:Date.now()},
+    members: [{id:hostId, name:name, joinedAt:Date.now()}], messages: []
+  };
+  nobarSave_(room);
+  return {ok:true, code:code, playerId:hostId, room:nobarPublic_(room, hostId)};
+}
+
+function nobarJoinRoom(payload) {
+  payload = payload || {};
+  const code = nobarNormalizeCode_(payload.code);
+  const name = nobarCleanName_(payload.name || 'Pemain');
+  const lock = LockService.getScriptLock(); lock.waitLock(10000);
+  try {
+    const room = nobarLoad_(code);
+    if (!room) throw new Error('Room NOBAR tidak ditemukan atau sudah kedaluwarsa.');
+    if (room.members.length >= NOBAR_CFG.MAX_MEMBERS) throw new Error('Room penuh. Maksimal 30 orang.');
+    // Selalu buat ID baru saat join agar nama host tidak bisa dipakai untuk mengambil alih kontrol.
+    const member = {id:Utilities.getUuid(), name:name, joinedAt:Date.now()};
+    room.members.push(member);
+    room.messages.push({id:Utilities.getUuid(), name:'AS NOBAR', text:name+' bergabung ke room 👋', at:Date.now(), system:true});
+    room.messages = room.messages.slice(-NOBAR_CFG.MAX_MESSAGES);
+    nobarSave_(room);
+    return {ok:true, code:code, playerId:member.id, room:nobarPublic_(room, member.id)};
+  } finally { lock.releaseLock(); }
+}
+
+
+function nobarListRooms() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const now = Date.now();
+  const rooms = [];
+  Object.keys(props).forEach(function(key) {
+    if (key.indexOf(NOBAR_CFG.PREFIX) !== 0) return;
+    try {
+      const room = JSON.parse(props[key]);
+      if (now - Number(room.updatedAt || room.createdAt) > NOBAR_CFG.TTL_MS) {
+        PropertiesService.getScriptProperties().deleteProperty(key); return;
+      }
+      const media = room.media || {};
+      rooms.push({code:room.code,hostName:room.hostName || 'Host',count:(room.members || []).length,title:media.title || '',type:media.type || '',playing:media.action === 'play'});
+    } catch (e) {}
+  });
+  rooms.sort(function(a,b){return b.count-a.count;});
+  return {ok:true,rooms:rooms};
+}
+
+function nobarGetState(payload) {
+  payload = payload || {};
+  const code = nobarNormalizeCode_(payload.code);
+  const room = nobarLoad_(code);
+  if (!room) throw new Error('Room NOBAR tidak ditemukan atau sudah kedaluwarsa.');
+  const id = String(payload.playerId || '');
+  if (!room.members.some(m => m.id === id)) throw new Error('Peserta tidak terdaftar di room ini.');
+  return {ok:true, room:nobarPublic_(room, id)};
+}
+
+/** WebRTC signaling: relai offer/answer/ICE antar anggota room. Tidak mengirim media lewat Apps Script. */
+function nobarRtcSend(payload) {
+  payload = payload || {};
+  const room = nobarRequireMember_(payload);
+  const from = String(payload.playerId || '');
+  const to = String(payload.to || '');
+  const kind = String(payload.kind || '');
+  if (!room.members.some(m => m.id === to)) throw new Error('Peserta tujuan tidak ada di room.');
+  if (!['offer','answer','ice','leave'].includes(kind)) throw new Error('Jenis sinyal WebRTC tidak valid.');
+  const data = payload.data;
+  const serialized = JSON.stringify(data == null ? null : data);
+  if (serialized.length > 12000) throw new Error('Pesan sinyal terlalu besar.');
+  const now = Date.now();
+  room.rtcSignals = (room.rtcSignals || []).filter(s => now - s.at < 120000).slice(-180);
+  room.rtcSignals.push({id:Utilities.getUuid(),from:from,to:to,kind:kind,data:data == null ? null : data,at:now});
+  nobarSave_(room);
+  return {ok:true};
+}
+function nobarRtcPoll(payload) {
+  payload = payload || {};
+  const room = nobarRequireMember_(payload);
+  const id = String(payload.playerId || '');
+  const now = Date.now();
+  room.rtcSignals = (room.rtcSignals || []).filter(s => now - s.at < 120000).slice(-180);
+  return {ok:true, signals:room.rtcSignals.filter(s => s.to === id), members:room.members.map(m=>({id:m.id,name:m.name,isHost:String(m.id)===String(room.hostId)})), hostId:room.hostId};
+}
+
+function nobarSetMedia(payload) {
+  payload = payload || {};
+  const lock = LockService.getScriptLock(); lock.waitLock(10000);
+  try {
+    const room = nobarRequireMember_(payload);
+    nobarRequireHost_(room, payload.playerId);
+    const parsed = nobarParseMedia_(String(payload.url || '').trim());
+    if (!parsed) throw new Error('Link belum didukung. Gunakan link YouTube, SoundCloud, atau URL HTTPS file audio/video langsung.');
+    room.media = {url:parsed.url, type:parsed.type, title:nobarCleanTitle_(payload.title || parsed.title), action:'pause', lastCommand:'pause', sequence:Number(room.media.sequence || 0)+1, changedAt:Date.now(), positionSeconds:0, positionAt:Date.now(), positionUpdatedAt:Date.now()};
+    room.messages.push({id:Utilities.getUuid(), name:'AS NOBAR', text:'Host mengganti tontonan: '+room.media.title+' 🎬', at:Date.now(), system:true});
+    room.messages = room.messages.slice(-NOBAR_CFG.MAX_MESSAGES);
+    nobarSave_(room);
+    return {ok:true, room:nobarPublic_(room, payload.playerId)};
+  } finally { lock.releaseLock(); }
+}
+
+/**
+ * Host memilih channel TV untuk seluruh anggota room.
+ * Hanya key channel yang diizinkan; URL tidak diterima bebas dari klien.
+ */
+function nobarSetTVChannel(payload) {
+  payload = payload || {};
+  const channels = {
+    tvri:  {name:'TVRI', url:'https://tvri.go.id/live'},
+    metro: {name:'Metro TV', url:'https://www.metrotvnews.com/live'},
+    tvone: {name:'tvOne', url:'https://www.tvonenews.com/live'},
+    rcti:  {name:'RCTI+', url:'https://www.rctiplus.com/tv/rcti'},
+    sctv:  {name:'SCTV', url:'https://www.vidio.com/live/204-sctv'}
+  };
+  const key = String(payload.channelKey || '').toLowerCase();
+  const channel = channels[key];
+  if (!channel) throw new Error('Channel TV tidak dikenal.');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const room = nobarRequireMember_(payload);
+    nobarRequireHost_(room, payload.playerId);
+    const previous = room.media || {};
+    room.media = {
+      url: channel.url,
+      type: 'tv',
+      title: channel.name,
+      channelKey: key,
+      action: 'pause',
+      lastCommand: 'load',
+      sequence: Number(previous.sequence || 0) + 1,
+      changedAt: Date.now(),
+      positionSeconds: 0,
+      positionAt: Date.now(),
+      positionUpdatedAt: Date.now()
+    };
+    room.messages.push({
+      id: Utilities.getUuid(),
+      name: 'AS NOBAR',
+      text: 'Host mengganti channel TV ke ' + channel.name + ' 📺',
+      at: Date.now(),
+      system: true
+    });
+    room.messages = room.messages.slice(-NOBAR_CFG.MAX_MESSAGES);
+    nobarSave_(room);
+    return {ok:true, room:nobarPublic_(room, payload.playerId)};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function nobarControl(payload) {
+  payload = payload || {};
+  const action = String(payload.action || '');
+  if (!['play','pause','replay'].includes(action)) throw new Error('Perintah pemutaran tidak valid.');
+  const lock = LockService.getScriptLock(); lock.waitLock(10000);
+  try {
+    const room = nobarRequireMember_(payload);
+    nobarRequireHost_(room, payload.playerId);
+    if (!room.media.url) throw new Error('Host pilih tontonan terlebih dahulu.');
+    room.media.action = action === 'replay' ? 'play' : action;
+    room.media.lastCommand = action;
+    if (action === 'replay') room.media.positionSeconds = 0;
+    room.media.sequence = Number(room.media.sequence || 0)+1;
+    room.media.changedAt = Date.now();
+    room.media.positionUpdatedAt = Date.now();
+    nobarSave_(room);
+    return {ok:true, room:nobarPublic_(room, payload.playerId)};
+  } finally { lock.releaseLock(); }
+}
+
+/** Simpan posisi host agar peserta lain dapat mengejar posisi tontonan. */
+function nobarSyncPosition(payload) {
+  payload = payload || {};
+  const room = nobarRequireMember_(payload);
+  nobarRequireHost_(room, payload.playerId);
+  if (!room.media || !room.media.url) return {ok:true, skipped:true};
+  const type = String(room.media.type || '');
+  if (!['youtube','soundcloud','audio','video'].includes(type)) return {ok:true, skipped:true};
+  const now = Date.now();
+  // Batasi penulisan agar polling pemain tidak membebani Script Properties.
+  if (now - Number(room.media.positionUpdatedAt || 0) < 3500) return {ok:true, skipped:true};
+  const position = Number(payload.positionSeconds);
+  if (!isFinite(position) || position < 0) throw new Error('Posisi media tidak valid.');
+  room.media.positionSeconds = Math.min(position, 86400);
+  room.media.positionAt = now;
+  room.media.positionUpdatedAt = now;
+  nobarSave_(room);
+  return {ok:true, positionSeconds:room.media.positionSeconds};
+}
+
+/** Jalankan sekali dari editor Apps Script untuk meminta izin Google Drive sebelum fitur upload dipakai. */
+function nobarAuthorizeDriveAccess() {
+  const root = DriveApp.getRootFolder();
+  return {ok:true, driveAccess:'ok', folderName:root.getName()};
+}
+
+/** Upload file media kecil ke Drive. File dibagikan dengan siapa pun yang memiliki link. */
+function nobarUploadMedia(payload) {
+  payload = payload || {};
+  const room = nobarRequireMember_(payload);
+  nobarRequireHost_(room, payload.playerId);
+  const data = String(payload.data || '');
+  const filename = String(payload.filename || 'AS-NOBAR-media').replace(/[\\/:*?"<>|#%{}\[\]]/g,'_').slice(0,120) || 'AS-NOBAR-media';
+  const mimeType = String(payload.mimeType || 'application/octet-stream').toLowerCase();
+  if (!/^(video|audio)\//.test(mimeType)) throw new Error('Pilih file audio atau video yang didukung browser.');
+  if (!data || data.length > 7 * 1024 * 1024) throw new Error('Ukuran file terlalu besar. Batas upload sekitar 5 MB per file.');
+  const bytes = Utilities.base64Decode(data);
+  if (bytes.length > 5 * 1024 * 1024) throw new Error('Ukuran file melebihi batas 5 MB.');
+  const blob = Utilities.newBlob(bytes, mimeType, filename);
+  const file = DriveApp.createFile(blob);
+  try {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (err) {
+    try { file.setTrashed(true); } catch (ignore) {}
+    throw new Error('File gagal dibagikan lewat link. Akun Google mungkin membatasi berbagi eksternal. Detail: ' + String(err.message || err).slice(0,180));
+  }
+  const mediaUrl = 'https://drive.google.com/file/d/' + file.getId() + '/view';
+  const parsed = nobarParseMedia_(mediaUrl);
+  room.media = {url:parsed.url, type:parsed.type, title:nobarCleanTitle_(payload.title || filename), action:'pause', lastCommand:'pause', sequence:Number((room.media||{}).sequence||0)+1, changedAt:Date.now(), positionSeconds:0, positionAt:Date.now(), positionUpdatedAt:Date.now(), driveFileId:file.getId()};
+  room.messages.push({id:Utilities.getUuid(), name:'AS NOBAR', text:'Host mengunggah media ke Drive: '+room.media.title+' 🎬', at:Date.now(), system:true});
+  room.messages = room.messages.slice(-NOBAR_CFG.MAX_MESSAGES);
+  nobarSave_(room);
+  return {ok:true, fileId:file.getId(), url:mediaUrl, room:nobarPublic_(room, payload.playerId), warning:'File dibagikan kepada siapa pun yang memiliki link. Jangan unggah video pribadi atau sensitif.'};
+}
+
+function nobarSendChat(payload) {
+  payload = payload || {};
+  const text = String(payload.text || '').trim();
+  if (!text) throw new Error('Pesan tidak boleh kosong.');
+  if (text.length > 160) throw new Error('Pesan maksimal 160 karakter.');
+  const lock = LockService.getScriptLock(); lock.waitLock(10000);
+  try {
+    const room = nobarRequireMember_(payload);
+    const member = room.members.find(m => m.id === String(payload.playerId));
+    room.messages.push({id:Utilities.getUuid(), name:member.name, text:text, at:Date.now(), system:false});
+    room.messages = room.messages.slice(-NOBAR_CFG.MAX_MESSAGES);
+    nobarSave_(room);
+    return {ok:true, room:nobarPublic_(room, payload.playerId)};
+  } finally { lock.releaseLock(); }
+}
+
+function nobarRequireMember_(payload) {
+  const room = nobarLoad_(nobarNormalizeCode_(payload.code));
+  if (!room) throw new Error('Room NOBAR tidak ditemukan atau kedaluwarsa.');
+  if (!room.members.some(m => m.id === String(payload.playerId || ''))) throw new Error('Kamu tidak terdaftar di room ini.');
+  return room;
+}
+function nobarRequireHost_(room, playerId) {
+  if (String(playerId || '') !== String(room.hostId || '')) throw new Error('Hanya host yang boleh mengontrol tontonan.');
+}
+function nobarPublic_(room, playerId) {
+  return {code:room.code, hostName:room.hostName, isHost:String(playerId)===String(room.hostId), media:room.media, members:room.members.map(m=>({id:m.id,name:m.name,isHost:String(m.id)===String(room.hostId)})), messages:room.messages, updatedAt:room.updatedAt};
+}
+function nobarSave_(room) {
+  room.updatedAt = Date.now();
+  PropertiesService.getScriptProperties().setProperty(NOBAR_CFG.PREFIX + room.code, JSON.stringify(room));
+}
+function nobarLoad_(code) {
+  if (!code) return null;
+  const raw = PropertiesService.getScriptProperties().getProperty(NOBAR_CFG.PREFIX + code);
+  if (!raw) return null;
+  try {
+    const room = JSON.parse(raw);
+    if (Date.now() - Number(room.updatedAt || room.createdAt) > NOBAR_CFG.TTL_MS) return null;
+    return room;
+  } catch (e) { return null; }
+}
+function nobarNormalizeCode_(code) { return String(code || '').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,5); }
+function nobarMakeCode_() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let i=0;i<30;i++) {
+    let code=''; for(let j=0;j<5;j++) code += chars.charAt(Math.floor(Math.random()*chars.length));
+    if (!nobarLoad_(code)) return code;
+  }
+  throw new Error('Tidak bisa membuat kode room NOBAR. Coba lagi.');
+}
+function nobarCleanName_(value) { return String(value || '').replace(/[<>]/g,'').replace(/\s+/g,' ').trim().slice(0,20) || 'Pemain'; }
+function nobarCleanTitle_(value) { return String(value || 'Tontonan NOBAR').replace(/[<>]/g,'').trim().slice(0,100) || 'Tontonan NOBAR'; }
+function nobarParseMedia_(url) {
+  if (!/^https:\/\//i.test(url)) return null;
+  let m;
+  m = url.match(/(?:youtube\.com\/(?:watch\?(?:[^#]*&)?v=|embed\/|shorts\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i);
+  if (m) return {url:'https://www.youtube.com/watch?v='+m[1], type:'youtube', title:'YouTube'};
+  m = url.match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?(?:[^#]*&)?id=)([A-Za-z0-9_-]{10,})/i);
+  if (m) return {url:'https://drive.google.com/file/d/'+m[1]+'/preview', type:'drive', title:'Google Drive'};
+  if (/^https:\/\/(?:www\.)?soundcloud\.com\//i.test(url) && !/soundcloud\.com\/(?:discover|search|you|stream)(?:\/|$)/i.test(url)) return {url:url, type:'soundcloud', title:'SoundCloud'};
+  if (/\.(mp3|m4a|aac|ogg|wav|mp4|webm)(?:[?#].*)?$/i.test(url)) return {url:url, type:/\.(mp4|webm)(?:[?#].*)?$/i.test(url)?'video':'audio', title:'Media langsung'};
+  return null;
+}
+
+
+/** Tes koneksi ringan untuk halaman AS NOBAR. Tidak mengubah atau menghapus data. */
+function nobarHealthCheck() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const testKey = NOBAR_CFG.PREFIX + '__HEALTH_CHECK__';
+    const marker = String(Date.now());
+    props.setProperty(testKey, marker);
+    const readBack = props.getProperty(testKey);
+    props.deleteProperty(testKey);
+    if (readBack !== marker) throw new Error('Penyimpanan Script Properties gagal dibaca kembali.');
+    return {ok:true, service:'AS NOBAR', storage:'ok', checkedAt:new Date().toISOString()};
+  } catch (err) {
+    throw new Error('Tes koneksi NOBAR gagal: ' + (err && err.message ? err.message : err));
+  }
+}
+
+
+/* ================= BANK VIDEO AS NOBAR =================
+ * Membaca spreadsheet dari Script Property NOBAR_SPREADSHEET_ID.
+ * Mendukung header: ID | Judul Video | Kategori | Link YouTube | Status.
+ */
+const NOBAR_BANK_SHEET = 'Bank Video';
+
+function nobarBankSpreadsheet_() {
+  const id = PropertiesService.getScriptProperties().getProperty('NOBAR_SPREADSHEET_ID');
+  if (!id) throw new Error('Script Property NOBAR_SPREADSHEET_ID belum diisi.');
+  return SpreadsheetApp.openById(id);
+}
+function nobarBankSheet_() {
+  const ss = nobarBankSpreadsheet_();
+  // Terima nama tab lama/varian nama yang pernah dipakai, tanpa menyentuh tab lain.
+  const names = [NOBAR_BANK_SHEET, 'BANK VIDEO AS NOBAR', 'Bank Video AS NOBAR', 'BANK VIDEO'];
+  let sh = null;
+  for (const name of names) { sh = ss.getSheetByName(name); if (sh) break; }
+  if (!sh) {
+    const first = ss.getSheets()[0];
+    if (first && first.getLastRow() === 0) sh = first;
+    else sh = ss.insertSheet(NOBAR_BANK_SHEET);
+  }
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1,1,1,5).setValues([['ID','Judul Video','Kategori','Link YouTube','Status']]);
+    sh.setFrozenRows(1);
+    sh.getRange(1,1,1,5).setFontWeight('bold');
+  }
+  return sh;
+}
+function nobarBankColumns_(sh) {
+  const headers = sh.getRange(1,1,1,Math.max(1,sh.getLastColumn())).getDisplayValues()[0]
+    .map(v => String(v || '').trim().toLowerCase().replace(/\s+/g,' '));
+  const find = names => {
+    for (const name of names) {
+      const idx = headers.indexOf(name.toLowerCase());
+      if (idx >= 0) return idx;
+    }
+    return -1;
+  };
+  const cols = {
+    id:find(['id']),
+    title:find(['judul video','judul','title']),
+    category:find(['kategori','category']),
+    url:find(['link youtube','link','url']),
+    status:find(['status'])
+  };
+  const missing = Object.keys(cols).filter(k => cols[k] < 0);
+  if (missing.length) {
+    throw new Error('Header Bank Video belum cocok. Pastikan baris 1 berisi: ID, Judul Video, Kategori, Link YouTube/URL, Status.');
+  }
+  return cols;
+}
+function nobarBankList() {
+  const sh = nobarBankSheet_();
+  const n = sh.getLastRow();
+  if (n < 2) return {ok:true,videos:[]};
+  const cols = nobarBankColumns_(sh);
+  const rows = sh.getRange(2,1,n-1,sh.getLastColumn()).getDisplayValues();
+  const videos = rows.filter(r => r[cols.id] && r[cols.title] && r[cols.url])
+    .filter(r => !r[cols.status] || /^(aktif|active|ready|tersedia)$/i.test(String(r[cols.status]).trim()))
+    .map(r => ({
+      id:String(r[cols.id]), title:String(r[cols.title]), category:String(r[cols.category] || 'Lainnya'),
+      url:String(r[cols.url]), type:(nobarParseMedia_(String(r[cols.url]))||{}).type||'link', status:String(r[cols.status] || 'Aktif')
+    })).reverse();
+  return {ok:true,videos:videos};
+}
+function nobarBankAdd(payload) {
+  payload = payload || {};
+  const room = nobarRequireMember_(payload); nobarRequireHost_(room,payload.playerId);
+  const title = nobarCleanTitle_(payload.title || 'Video YouTube');
+  const category = String(payload.category || 'Lainnya').replace(/[<>]/g,'').trim().slice(0,40) || 'Lainnya';
+  const url = String(payload.url || '').trim();
+  const parsed = nobarParseMedia_(url);
+  if (!parsed) throw new Error('Masukkan link YouTube, Google Drive, SoundCloud, atau URL HTTPS langsung file audio/video.');
+  const sh = nobarBankSheet_(), cols = nobarBankColumns_(sh);
+  const existing = nobarBankList().videos;
+  if (existing.some(v => v.url === parsed.url)) throw new Error('Video ini sudah ada di Bank Video.');
+  const row = new Array(sh.getLastColumn()).fill('');
+  row[cols.id] = Utilities.getUuid();
+  row[cols.title] = title;
+  row[cols.category] = category;
+  row[cols.url] = parsed.url;
+  row[cols.status] = 'Aktif';
+  sh.appendRow(row);
+  return {ok:true,video:{id:row[cols.id],title:title,url:parsed.url,type:parsed.type,category:category,status:'Aktif'},videos:nobarBankList().videos};
+}
+function nobarBankDelete(payload) {
+  payload = payload || {};
+  const room = nobarRequireMember_(payload); nobarRequireHost_(room,payload.playerId);
+  const id = String(payload.id || '');
+  if (!id) throw new Error('ID video tidak valid.');
+  const sh = nobarBankSheet_(), cols = nobarBankColumns_(sh), n=sh.getLastRow();
+  if(n>=2){
+    const ids=sh.getRange(2,cols.id+1,n-1,1).getDisplayValues();
+    for(let i=ids.length-1;i>=0;i--){
+      if(ids[i][0]===id){sh.deleteRow(i+2);return {ok:true,videos:nobarBankList().videos};}
+    }
+  }
+  throw new Error('Video tidak ditemukan di Bank Video.');
+}
+
+/**
+ * Cari video YouTube memakai Gemini dengan Google Search grounding.
+ * Kunci API hanya dibaca di server melalui Script Properties.
+ */
+function nobarGeminiSearchVideos(payload) {
+  payload = payload || {};
+  const room = nobarRequireMember_(payload);
+  nobarRequireHost_(room, payload.playerId);
+  const query = String(payload.query || '').trim().slice(0,160);
+  if (!query) throw new Error('Masukkan kata kunci video yang ingin dicari.');
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_NOBAR_API_KEY');
+  if (!key) throw new Error('Script Property GEMINI_NOBAR_API_KEY belum diisi.');
+  const prompt = 'Cari video YouTube yang benar-benar ada untuk kata kunci: "' + query + '". ' +
+    'Gunakan Google Search untuk menemukan hasil langsung dari YouTube. Kembalikan JSON array maksimal 8 item, ' +
+    'masing-masing {"title":"judul video","url":"URL YouTube langsung","category":"kategori singkat"}. ' +
+    'Gunakan hanya URL YouTube yang ditemukan dari hasil pencarian, utamakan https://www.youtube.com/watch?v=ID. ' +
+    'Jangan pernah membuat atau menebak URL/ID video. Jika tidak ada link YouTube langsung yang dapat diverifikasi, kembalikan [].';
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent';
+  const response = UrlFetchApp.fetch(url, {
+    method:'post',
+    contentType:'application/json',
+    headers:{'x-goog-api-key':key},
+    payload:JSON.stringify({
+      contents:[{role:'user',parts:[{text:prompt}]}],
+      tools:[{google_search:{}}],
+      generationConfig:{temperature:0.2,maxOutputTokens:5000,responseMimeType:'application/json'}
+    }),
+    muteHttpExceptions:true
+  });
+  const status = response.getResponseCode(), body = response.getContentText();
+  if (status < 200 || status >= 300) {
+    let detail = body;
+    try { const e = JSON.parse(body); detail = e.error && e.error.message || body; } catch (err) {}
+    throw new Error('Pencarian Gemini gagal (HTTP '+status+'): '+String(detail).slice(0,350));
+  }
+  const data = JSON.parse(body);
+  const candidate = data.candidates && data.candidates[0];
+  const textOut = candidate && candidate.content && candidate.content.parts
+    ? candidate.content.parts.map(p => p.text || '').join('') : '';
+  let parsed = [];
+  if (textOut) {
+    try { parsed = JSON.parse(textOut.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'')); } catch (err) { parsed = []; }
+  }
+  if (!Array.isArray(parsed)) parsed = [];
+  // Hanya menerima link YouTube valid yang bisa dinormalisasi oleh parser.
+  const seen = {};
+  const videos = [];
+  parsed.forEach(item => {
+    if (!item) return;
+    const media = nobarParseMedia_(String(item.url || '').trim());
+    if (!media || media.type !== 'youtube' || seen[media.url]) return;
+    seen[media.url] = true;
+    videos.push({
+      title:nobarCleanTitle_(item.title || 'Video YouTube'),
+      url:media.url,
+      category:String(item.category || query).replace(/[<>]/g,'').trim().slice(0,40) || 'Lainnya'
+    });
+  });
+  // Grounding chunks can contain direct YouTube links even if the JSON misses them.
+  const chunks = candidate && candidate.groundingMetadata && candidate.groundingMetadata.groundingChunks || [];
+  chunks.forEach(chunk => {
+    const web = chunk && chunk.web;
+    if (!web || !web.uri) return;
+    const media = nobarParseMedia_(String(web.uri));
+    if (!media || media.type !== 'youtube' || seen[media.url]) return;
+    seen[media.url] = true;
+    videos.push({title:nobarCleanTitle_(web.title || 'Video YouTube'),url:media.url,category:query.slice(0,40)});
+  });
+  return {ok:true,query:query,videos:videos.slice(0,8),message:videos.length ? '' : 'Gemini belum menemukan tautan YouTube langsung yang bisa diverifikasi. Coba kata kunci lain.'};
+}
